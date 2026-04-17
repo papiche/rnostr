@@ -331,6 +331,145 @@ GAP 3 et 4 sont **résolus automatiquement** si le bridge bash (GAP 1) est reten
 
 ---
 
+## Nouvelle capacité : Mode "Shield" (lecture restreinte aux amisOfAmis)
+
+### Problème actuel
+
+**Strfry n'a aucun contrôle de lecture.** N'importe quel client NOSTR peut se connecter
+et envoyer un `REQ` pour exporter la totalité des événements stockés — profils (kind 0),
+messages (kind 1), transactions (kind 7), données app (kind 30078), etc.
+
+L'écriture est filtrée (writePolicy plugin NIP-101), mais la **lecture est totalement ouverte**.
+C'est un problème de vie privée dans un réseau coopératif où les événements peuvent contenir
+des données personnelles ou des transactions sensibles.
+
+### Infrastructure déjà présente dans rnostr
+
+`extensions/src/auth.rs` — l'extension `auth` de rnostr supporte déjà `auth.req.pubkey_whitelist` :
+
+```rust
+// auth.rs lignes 235-246
+IncomingMessage::Req(sub) | IncomingMessage::Count(sub) => {
+    if let Err(err) = Self::verify_permission(
+        self.setting.req.as_ref(),   // ← Permission REQ
+        state.and_then(|s| s.pubkey()),
+        ...
+    ) {
+        // Client non-authentifié ou pubkey absente → CLOSED "auth-required"
+        return OutgoingMessage::closed(&sub.id, &msg).into();
+    }
+}
+```
+
+Si `[auth.req] pubkey_whitelist` est défini, un client qui n'a pas fait NIP-42 AUTH
+reçoit `CLOSED "auth-required: NIP-42 auth required"` sur chaque REQ.
+
+**Ce qui manque :** `List` (défini dans `relay/src/list.rs`) est un `Vec<String>` statique
+lu depuis le TOML. Il n'y a pas de `pubkey_whitelist_file` pour pointer vers `amisOfAmis.txt`.
+
+### Solution : `pubkey_whitelist_file` dans `Permission`
+
+Modification Rust mineure dans `extensions/src/auth.rs` :
+
+```rust
+#[derive(Deserialize, Default, Debug)]
+pub struct Permission {
+    pub ip_whitelist: Option<List>,
+    pub pubkey_whitelist: Option<List>,
+    pub ip_blacklist: Option<List>,
+    pub pubkey_blacklist: Option<List>,
+    pub event_pubkey_whitelist: Option<List>,
+    pub event_pubkey_blacklist: Option<List>,
+    pub allow_mentioning_whitelisted_pubkeys: bool,
+    // NOUVEAU :
+    pub pubkey_whitelist_file: Option<String>,    // chemin vers un fichier (1 pubkey HEX par ligne)
+    pub pubkey_blacklist_file: Option<String>,    // idem pour blacklist
+    pub file_reload_secs: u64,                    // rechargement périodique (défaut 60s)
+}
+```
+
+Dans la méthode `setting()`, charger le fichier et merger dans `pubkey_whitelist` :
+
+```rust
+fn setting(&mut self, setting: &SettingWrapper) {
+    let mut w = setting.write();
+    self.setting = w.parse_extension(self.name());
+    // Charger pubkey_whitelist_file si spécifié
+    if let Some(ref path) = self.setting.req.as_ref().and_then(|p| p.pubkey_whitelist_file.clone()) {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let keys: Vec<String> = content.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            // Merger avec la whitelist statique TOML
+            let perm = self.setting.req.get_or_insert_with(Permission::default);
+            let list = perm.pubkey_whitelist.get_or_insert_with(|| List(vec![]));
+            list.extend(keys);
+        }
+    }
+    // Idem pour pubkey_blacklist_file...
+}
+```
+
+Pour le rechargement périodique indépendant du `--watch` TOML, utiliser un thread Tokio
+avec `tokio::time::interval` + `Arc<RwLock<AuthSetting>>`.
+
+### Configuration TOML mode Shield
+
+```toml
+[auth]
+enabled = true
+
+# Mode shield : lecture restreinte aux amisOfAmis
+[auth.req]
+pubkey_whitelist_file = "/home/$USER/.zen/strfry/amisOfAmis.txt"
+file_reload_secs = 60      # rechargement toutes les 60 secondes
+
+# Écriture : filtrée par le bash-policy bridge (GAP 1)
+# [auth.event] n'est pas nécessaire si bash-policy est actif
+```
+
+### Impact sur le backfill constellation (N²)
+
+`backfill_constellation.sh` utilise `nostr_websocket_backfill.py` pour se connecter
+aux relays des peers via le tunnel IPFS P2P (port 9999). En mode shield :
+
+- Le relay local en mode shield envoie `["AUTH", "<challenge>"]` dès la connexion
+- Le script de backfill du peer doit répondre `["AUTH", event_kind_22242]` avec
+  la keypair NOSTR de la station distante
+- La pubkey de la station distante **doit être dans `amisOfAmis.txt`** pour que son REQ soit accepté
+
+> **Par définition N²**, les pubkeys des stations de la constellation sont dans `amisOfAmis.txt`
+> (mis à jour par `NODE.refresh.sh`, `NOSTR.UMAP.refresh.sh`, etc.).
+> La contrainte est donc automatiquement satisfaite — si `nostr_websocket_backfill.py`
+> implémente NIP-42 AUTH avec la keypair de la station.
+
+**Modification nécessaire dans `nostr_websocket_backfill.py` :**
+```python
+# À ajouter : répondre au challenge AUTH avec la keypair de la station locale
+async def handle_auth_challenge(ws, challenge: str, privkey: str):
+    auth_event = build_kind_22242_event(challenge, privkey)
+    await ws.send(json.dumps(["AUTH", auth_event]))
+```
+
+La keypair de la station est disponible via `my.sh` → `$GPGKEY` / `$NSEC`.
+
+### Points non-impactés par le mode shield
+
+- `strfry scan` (usage interne DB) — lecture directe LMDB, bypass le relay WebSocket
+- `rnostr export` (équivalent rnostr) — idem, accès direct DB
+- Clients LAN authentifiés (même si shield activé, peuvent faire NIP-42)
+- `ip_whitelist = ["127.0.0.1"]` — option alternative pour autoriser localhost sans NIP-42
+
+### Ce que strfry ne peut pas faire (avantage rnostr)
+
+strfry n'expose aucun mécanisme de filtrage en lecture (`REQ`). Le writePolicy plugin
+ne s'applique qu'aux événements entrants (`EVENT`). **Le mode shield est exclusif à rnostr.**
+
+**Durée estimée : 1-2 jours** (ajout `pubkey_whitelist_file` + reload + NIP-42 dans backfill).
+
+---
+
 ## Ce qui ne change pas
 
 - Les scripts NIP-101 (`all_but_blacklist.sh`, `process.sh`, filtres `filter/*.sh`)
